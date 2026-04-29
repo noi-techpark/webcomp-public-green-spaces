@@ -34,11 +34,12 @@ export class ViewportDataLoader {
   }
 
  
-  async loadTypeData(greenCodeType, onProgress = null) {
+  async loadTypeData(greenCodeType, onProgress = null, greenCodeSubtype = null) {
+    const cacheKey = this._cacheKey(greenCodeType, greenCodeSubtype);
     // Check memory cache first
-    if (this.memoryCache.has(greenCodeType)) {
-      const cached = this.memoryCache.get(greenCodeType);
-      console.log(`⚡ Memory cache hit: ${cached.length} features`);
+    if (this.memoryCache.has(cacheKey)) {
+      const cached = this.memoryCache.get(cacheKey);
+      console.log(`⚡ Memory cache hit ${cacheKey}: ${cached.length} features`);
       return cached;
     }
 
@@ -47,11 +48,12 @@ export class ViewportDataLoader {
     const signal = this.abortController.signal;
 
     const config = TYPE_CONFIG[greenCodeType] || { maxPages: 5, loadAll: false };
-    console.log(`🔄 Loading ${config.name} (type ${greenCodeType})...`);
+    const subtypeLabel = greenCodeSubtype ? ` subtype ${greenCodeSubtype}` : '';
+    console.log(`🔄 Loading ${config.name} (type ${greenCodeType}${subtypeLabel})...`);
     const startTime = performance.now();
 
   
-    const firstUrl = this._buildUrl(greenCodeType, 1);
+    const firstUrl = this._buildUrl(greenCodeType, 1, greenCodeSubtype);
     const firstResult = await this._fetchPage(firstUrl, signal);
 
     if (!firstResult.success || signal.aborted) {
@@ -76,7 +78,7 @@ export class ViewportDataLoader {
 
         const batch = remainingPages.slice(i, i + PARALLEL_PAGES);
         const batchPromises = batch.map(page =>
-          this._fetchPage(this._buildUrl(greenCodeType, page), signal)
+          this._fetchPage(this._buildUrl(greenCodeType, page, greenCodeSubtype), signal)
         );
 
         const batchResults = await Promise.all(batchPromises);
@@ -99,7 +101,7 @@ export class ViewportDataLoader {
 
     // Cache in memory
     if (!signal.aborted && allFeatures.length > 0) {
-      this.memoryCache.set(greenCodeType, allFeatures);
+      this.memoryCache.set(cacheKey, allFeatures);
     }
 
     return allFeatures;
@@ -113,7 +115,11 @@ export class ViewportDataLoader {
     return [];
   }
 
-  _buildUrl(greenCodeType, page) {
+  _cacheKey(greenCodeType, greenCodeSubtype = null) {
+    return greenCodeSubtype ? `${greenCodeType}:${greenCodeSubtype}` : String(greenCodeType);
+  }
+
+  _buildUrl(greenCodeType, page, greenCodeSubtype = null) {
     const url = new URL(this.endpoint);
 
     // Include Detail field for accurate feature names from API
@@ -129,6 +135,9 @@ export class ViewportDataLoader {
 
     // CORRECT parameter name: greencodetype (not type!)
     url.searchParams.set('greencodetype', greenCodeType);
+    if (greenCodeSubtype) {
+      url.searchParams.set('greencodesubtype', greenCodeSubtype);
+    }
 
     // Only active
     url.searchParams.set('active', 'true');
@@ -234,10 +243,7 @@ export class ViewportDataLoader {
     // MULTIPOLYGON
     const multiPolyMatch = str.match(/^MULTIPOLYGON\s*\(([\s\S]+)\)$/i);
     if (multiPolyMatch) {
-      const body = this._stripOuterParens(multiPolyMatch[1]);
-      if (!body) return null;
-
-      const polygonGroups = this._splitTopLevelParenGroups(body);
+      const polygonGroups = this._splitTopLevelParenGroups(multiPolyMatch[1]);
       if (!polygonGroups?.length) return null;
 
       const polygons = polygonGroups
@@ -261,9 +267,7 @@ export class ViewportDataLoader {
   }
 
   _parsePolygonFromWktBody(body) {
-    const ringsList = this._stripOuterParens(body);
-    if (!ringsList) return null;
-    return this._parsePolygonFromRingsList(ringsList);
+    return this._parsePolygonFromRingsList(body);
   }
 
   _parsePolygonFromRingsList(ringsList) {

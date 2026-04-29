@@ -1,22 +1,24 @@
+
 // SPDX-FileCopyrightText: NOI Techpark <digital@noi.bz.it>
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-const maplibregl = require("maplibre-gl");
-import "maplibre-gl/dist/maplibre-gl.css";
-import * as pmtiles from "pmtiles";
-import Supercluster from "supercluster";
 import { ViewportDataLoader } from "./ViewportDataLoader.js";
 import { getGreenSpaceInfo } from "./GreenSpaceDictionary.js";
-import { iconUrlMap, logoUrl, navBtnUrl } from "./iconAssets.js";
+import { iconUrlMap, navBtnUrl } from "./iconAssets.js";
 
+const MAPLIBRE_CSS_FILE = "maplibre-gl.css";
+const MAPLIBRE_JS_FILE = "maplibre-gl.js";
+const COMPONENT_ASSET_SCRIPT_NAMES = [
+  "webcomp-boilerplate.min.js",
+  "webcomp-boilerplate.js",
+  "maplibre-gl.js"
+];
 const DEFAULT_CENTER = [11.8768, 45.4064]; // Padova
 const DEFAULT_ZOOM = 13;
 const DEBOUNCE_MS = 300;
 const LIVE_ZOOM_IN = 14.5;
 const LIVE_ZOOM_OUT = 13.5;
-const PMTILES_SOURCE = "pmtiles";
-const PMTILES_SOURCE_LAYER = "urbangreen";
 
 const MAIN_TYPES = {
   "1": {
@@ -34,7 +36,7 @@ const MAIN_TYPES = {
       "trees": {
         name: "Trees & Plants",
         subtypes: ["03"],
-        geometries: ["Point"],
+        geometries: ["Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"],
         icon: "ic-trees.svg",
         color: "#228B22",
         tooltip: "Individual trees, shrubs, and plant groups"
@@ -204,19 +206,12 @@ const LIVE_LAYER_IDS = [
   "polygons-outline-outer",
   "lines-outer",
   "lines",
-  "clusters",
-  "cluster-count",
   "points"
 ];
 
-const PM_LAYER_IDS = [
-  "pm-polygons-fill",
-  "pm-polygons-outline",
-  "pm-polygons-outline-outer",
-  "pm-lines-outer",
-  "pm-lines",
-  "pm-points"
-];
+const POLYGON_GEOMETRY_FILTER = ["in", ["geometry-type"], ["literal", ["Polygon", "MultiPolygon"]]];
+const LINE_GEOMETRY_FILTER = ["in", ["geometry-type"], ["literal", ["LineString", "MultiLineString"]]];
+const POINT_GEOMETRY_FILTER = ["in", ["geometry-type"], ["literal", ["Point", "MultiPoint"]]];
 
 class UrbanGreenMapV2 extends HTMLElement {
   static get observedAttributes() {
@@ -228,33 +223,19 @@ class UrbanGreenMapV2 extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this.map = null;
     this.loader = null;
-    this.cluster = null;
     this.currentType = null;
     this.currentSubCategory = null;
     this.debounceTimer = null;
     this._seq = 0;
     this._currentFeatures = null;
-    this._dataMode = "live";
     this._featureClicked = false;
-    this.pmtilesUrl = null;
-    this.pmtilesReady = false;
-    this.pmtilesArchive = null;
-    this.pmtilesProtocol = null;
-    this._pmAllowedGeometries = null;
-    this._pmHasCategory = false;
-    this._pmSubtypeColorExpr = null;
     this._configuredLayers = [];
     this._viewRequestSeq = 0;
     this._geocodeCache = new Map();
-
-    this._pmGreenCodeExpr = ["to-string", ["coalesce", ["get", "greenCode"], ["get", "code"], ""]];
-    this._pmTypeExpr = ["to-string", ["coalesce", ["get", "greenCodeType"], ["get", "type"], ["slice", this._pmGreenCodeExpr, 1, 2]]];
-    this._pmSubtypeExpr = ["slice", this._pmGreenCodeExpr, 2, 4];
+    this._resizeObserver = null;
   }
 
   connectedCallback() {
-    const pmtilesAttr = this.getAttribute("pmtiles-url");
-    this.pmtilesUrl = pmtilesAttr && pmtilesAttr.trim() ? pmtilesAttr.trim() : null;
     this._configuredLayers = this.parseLayersAttribute();
     this.render();
     this.initMap();
@@ -271,10 +252,12 @@ class UrbanGreenMapV2 extends HTMLElement {
 
     if ((name === "lat" || name === "lng" || name === "zoom" || name === "city" || name === "country") && this.map) {
       this.applyConfiguredView({ preserveCurrentWhenMissing: true });
+      return;
     }
   }
 
   disconnectedCallback() {
+    this._resizeObserver?.disconnect();
     this.loader?.abort();
     this.map?.remove();
   }
@@ -289,28 +272,34 @@ class UrbanGreenMapV2 extends HTMLElement {
   }
 
   get liveZoomIn() {
-    const val = parseFloat(this.getAttribute("live-zoom-in"));
+    const val = this.parseNumberAttribute("live-zoom-in");
     return Number.isFinite(val) ? val : LIVE_ZOOM_IN;
   }
 
   get liveZoomOut() {
-    const val = parseFloat(this.getAttribute("live-zoom-out"));
+    const val = this.parseNumberAttribute("live-zoom-out");
     return Number.isFinite(val) ? val : LIVE_ZOOM_OUT;
   }
 
   get initialLat() {
-    const val = parseFloat(this.getAttribute("lat"));
+    const val = this.parseNumberAttribute("lat");
     return Number.isFinite(val) && val >= -90 && val <= 90 ? val : null;
   }
 
   get initialLng() {
-    const val = parseFloat(this.getAttribute("lng"));
+    const val = this.parseNumberAttribute("lng");
     return Number.isFinite(val) && val >= -180 && val <= 180 ? val : null;
   }
 
   get initialZoom() {
-    const val = parseFloat(this.getAttribute("zoom"));
+    const val = this.parseNumberAttribute("zoom");
     return Number.isFinite(val) ? Math.max(0, Math.min(22, val)) : null;
+  }
+
+  parseNumberAttribute(name) {
+    const raw = this.getAttribute(name);
+    if (!raw || !raw.trim()) return NaN;
+    return Number(raw.trim().replace(",", "."));
   }
 
   get cityName() {
@@ -321,10 +310,6 @@ class UrbanGreenMapV2 extends HTMLElement {
   get countryName() {
     const val = this.getAttribute("country");
     return val && val.trim() ? val.trim() : null;
-  }
-
-  usesPmtiles() {
-    return !!this.pmtilesUrl;
   }
 
   getConfiguredCenter(fallback = DEFAULT_CENTER) {
@@ -469,17 +454,11 @@ class UrbanGreenMapV2 extends HTMLElement {
     this.closeSidebar();
     this.hideLoader();
 
-    if (this.usesPmtiles()) {
-      this.updatePmtilesFilters();
-    }
-
-    if (this.isLiveMode()) {
-      if (this.getSelectedCategories().length) {
-        this.loadData();
-      } else {
-        this.loader?.abort();
-        this.clearMap();
-      }
+    if (this.getSelectedCategories().length) {
+      this.loadData();
+    } else {
+      this.loader?.abort();
+      this.clearMap();
     }
   }
 
@@ -514,11 +493,10 @@ class UrbanGreenMapV2 extends HTMLElement {
 
   render() {
     this.shadowRoot.innerHTML = `
+      <link rel="stylesheet" href="${this.getAssetUrl(MAPLIBRE_CSS_FILE)}">
       <style>
-        :host { display: block; width: 100%; height: 100%; font-family: system-ui, sans-serif; }
-        .container { display: flex; flex-direction: column; height: 100%; }
-        .header { padding: 12px; background: #f5f5f5; text-align: center; border-bottom: 1px solid #ddd; }
-        .header img { height: 40px; }
+        :host { display: block; width: 100%; min-height: 700px; height: 100%; font-family: system-ui, sans-serif; }
+        .container { display: flex; flex-direction: column; min-height: inherit; height: 100%; }
         .title { padding: 16px; text-align: center; background: #fff; }
         .title h2 { margin: 0 0 8px; font-size: 20px; text-transform: uppercase; }
         .title p { margin: 0; color: #666; font-size: 14px; }
@@ -548,14 +526,14 @@ class UrbanGreenMapV2 extends HTMLElement {
         .chip-tooltip::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
                                border: 6px solid transparent; border-top-color: #333; }
         .chip:hover .chip-tooltip { opacity: 1; visibility: visible; }
-        .footer { padding: 16px 20px; background: #f5f5f5; display: flex; justify-content: flex-end; align-items: center; gap: 10px; position: relative; z-index: 10; }
-        .footer a { display: inline-flex; align-items: center; gap: 10px; color: #0066cc; text-decoration: none; font-size: 14px; font-weight: 500; cursor: pointer; position: relative; z-index: 11; }
-        .footer a:hover { text-decoration: underline; color: #004499; }
-        .footer img { height: 32px; width: auto; }
-
         /* Map wrapper for sidebar positioning */
-        .map-wrapper { position: relative; flex: 1; min-height: 400px; }
+        .map-wrapper { position: relative; flex: 1 1 auto; min-height: 400px; }
         .map-wrapper #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+        .map-error { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+                     padding: 24px; background: #f8f8f8; color: #333; text-align: center; z-index: 20; }
+        .map-error.show { display: flex; }
+        .map-error strong { display: block; margin-bottom: 8px; }
+        .map-error span { display: block; max-width: 520px; line-height: 1.45; }
 
         .sidebar { position: absolute; top: 12px; left: -340px; width: 300px; max-height: calc(100% - 24px);
                    background: #fff; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.15);
@@ -567,7 +545,6 @@ class UrbanGreenMapV2 extends HTMLElement {
         .sidebar-close:hover { color: #333; }
         .sidebar-content { padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; flex: 1; }
 
-        /* Icon card at top */
         .sidebar-icon { width: 100%; aspect-ratio: 1.2; max-height: 120px; background: #f8f8f8; border-radius: 12px;
                         display: flex; align-items: center; justify-content: center; margin-bottom: 4px; }
         .sidebar-icon img { max-width: 70px; max-height: 70px; object-fit: contain; }
@@ -604,9 +581,6 @@ class UrbanGreenMapV2 extends HTMLElement {
       </style>
 
       <div class="container">
-        <div class="header">
-          <img src="${logoUrl}" alt="Open Data Hub" />
-        </div>
         <div class="title">
           <h2>Explore Urban Green Spaces</h2>
           <p>Discover vegetation, urban furniture, and green infrastructure in Padova</p>
@@ -625,6 +599,7 @@ class UrbanGreenMapV2 extends HTMLElement {
         </div>
         <div class="map-wrapper">
           <div id="map"></div>
+          <div class="map-error" id="mapError" role="status" aria-live="polite"></div>
           <div class="sidebar" id="sidebar">
             <div class="sidebar-header">
               <button class="sidebar-close" id="closeSidebar">&times;</button>
@@ -643,12 +618,6 @@ class UrbanGreenMapV2 extends HTMLElement {
             <div class="spinner"></div>
             <div class="loader-text" id="loaderText">Loading...</div>
           </div>
-        </div>
-        <div class="footer">
-          <a href="https://opendatahub.com" target="_blank">
-            powered by Open Data Hub
-            <img src="${logoUrl}" alt="Open Data Hub" />
-          </a>
         </div>
       </div>
     `;
@@ -726,7 +695,6 @@ class UrbanGreenMapV2 extends HTMLElement {
       this.currentType = null;
       this.currentSubCategory = null;
       this._currentFeatures = null;
-      this.cluster = null;
       this.clearMap();
       this.closeSidebar();
       return;
@@ -741,12 +709,7 @@ class UrbanGreenMapV2 extends HTMLElement {
 
     // Reset zoom to default when changing category
     this.resetMapView();
-    this.updatePmtilesFilters();
-    if (this.isLiveMode()) {
-      this.loadData();
-    } else {
-      this.closeSidebar();
-    }
+    this.loadData();
   }
 
   onSubCategoryChange(subKey) {
@@ -756,12 +719,7 @@ class UrbanGreenMapV2 extends HTMLElement {
     this.resetMapView();
 
     // Data is already cached by type, just re-filter and display
-    this.updatePmtilesFilters();
-    if (this.isLiveMode()) {
-      this.loadData();
-    } else {
-      this.closeSidebar();
-    }
+    this.loadData();
   }
 
   // Reset map to default center and zoom
@@ -771,55 +729,153 @@ class UrbanGreenMapV2 extends HTMLElement {
 
   initMap() {
     this.loader = new ViewportDataLoader(this.apiBase, this.lang);
+    const maplibregl = this.getMapLibre();
 
-    if (this.usesPmtiles() && !window.__pmtilesProtocol) {
-      window.__pmtilesProtocol = new pmtiles.Protocol();
-      maplibregl.addProtocol("pmtiles", window.__pmtilesProtocol.tile);
+    if (!maplibregl) {
+      this.loadMapLibreScript()
+        .then(() => {
+          if (this.isConnected && !this.map) this.initMap();
+        })
+        .catch(err => {
+          console.error("MapLibre loading error:", err);
+          this.showMapError(
+            "MapLibre is not loaded",
+            `The component could not load ${this.getAssetUrl(MAPLIBRE_JS_FILE)}.`
+          );
+        });
+      return;
     }
-    this.pmtilesProtocol = this.usesPmtiles() ? window.__pmtilesProtocol : null;
 
-    this.map = new maplibregl.Map({
-      container: this.shadowRoot.querySelector("#map"),
-      center: this.getConfiguredCenter(),
-      zoom: this.getConfiguredZoom(),
-      style: {
-        version: 8,
-        glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
-        sources: {
-          osm: {
-            type: "raster",
-            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-            tileSize: 256
-          }
-        },
-        layers: [{ id: "osm", type: "raster", source: "osm" }]
-      }
-    });
+    try {
+      this.map = new maplibregl.Map({
+        container: this.shadowRoot.querySelector("#map"),
+        center: this.getConfiguredCenter(),
+        zoom: this.getConfiguredZoom(),
+        failIfMajorPerformanceCaveat: false,
+        style: {
+          version: 8,
+          glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+          sources: {
+            osm: {
+              type: "raster",
+              tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+              tileSize: 256
+            }
+          },
+          layers: [{ id: "osm", type: "raster", source: "osm" }]
+        }
+      });
+    } catch (err) {
+      console.error("MapLibre initialization error:", err);
+      this.showMapError(
+        "Map initialization failed",
+        err?.message || "The browser could not initialize the WebGL map."
+      );
+      this.map = null;
+      return;
+    }
+
+    this.hideMapError();
 
     this.map.addControl(new maplibregl.NavigationControl());
+    this.setupMapResizeObserver();
+
+    this.map.on("error", e => {
+      const err = e?.error || e;
+      console.error("MapLibre error:", err);
+      if (String(err?.message || err).includes("WebGL")) {
+        this.showMapError(
+          "WebGL is not available",
+          "This map needs WebGL. Enable hardware acceleration/WebGL in the browser or test with another browser/profile."
+        );
+      }
+    });
 
     this.map.on("load", () => {
       this.setupLiveLayers();
       this.setupBaseInteractions();
       this.setupLiveInteractions();
-      if (this.usesPmtiles()) {
-        this.setupPmtiles();
+      if (this.getSelectedCategories().length) {
+        this.loadData();
       }
-      this.updateDataMode(true);
       this.applyConfiguredView({ duration: 0 });
+      this.map.resize();
     });
-
-    // Re-cluster points on zoom/pan (no API reload, just re-render clusters)
-    this.map.on("moveend", () => this.onMapMove());
-    this.map.on("zoomend", () => this.updateDataMode());
   }
 
-  onMapMove() {
-    if (!this.isLiveMode()) return;
-    // Only re-cluster if we have data and it contains points
-    if (this._currentFeatures && this.cluster) {
-      this.renderClusters();
+  getMapLibre() {
+    return window.maplibregl || null;
+  }
+
+  loadMapLibreScript() {
+    if (window.maplibregl) return Promise.resolve();
+
+    if (!window.__urbanGreenMapLibreScriptPromise) {
+      window.__urbanGreenMapLibreScriptPromise = new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = this.getAssetUrl(MAPLIBRE_JS_FILE);
+        script.async = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error(`Failed to load ${script.src}`));
+        document.head.appendChild(script);
+      });
     }
+
+    return window.__urbanGreenMapLibreScriptPromise;
+  }
+
+  getAssetUrl(fileName) {
+    return new URL(fileName, this.getComponentAssetBaseUrl()).href;
+  }
+
+  getComponentAssetBaseUrl() {
+    const currentScriptUrl = document.currentScript?.src;
+    if (currentScriptUrl) return currentScriptUrl;
+
+    const scripts = Array.from(document.scripts);
+    const assetScript = scripts.find(script => {
+      if (!script.src) return false;
+      return COMPONENT_ASSET_SCRIPT_NAMES.some(fileName => script.src.includes(`/${fileName}`) || script.src.endsWith(fileName));
+    });
+
+    return assetScript?.src || window.location.href;
+  }
+
+  showMapError(title, message) {
+    const errorEl = this.shadowRoot?.querySelector("#mapError");
+    if (!errorEl) return;
+
+    errorEl.innerHTML = `
+      <span>
+        <strong>${title}</strong>
+        ${message}
+      </span>
+    `;
+    errorEl.classList.add("show");
+  }
+
+  hideMapError() {
+    const errorEl = this.shadowRoot?.querySelector("#mapError");
+    if (!errorEl) return;
+
+    errorEl.innerHTML = "";
+    errorEl.classList.remove("show");
+  }
+
+  setupMapResizeObserver() {
+    if (typeof ResizeObserver === "undefined") {
+      requestAnimationFrame(() => this.map?.resize());
+      return;
+    }
+
+    this._resizeObserver?.disconnect();
+    this._resizeObserver = new ResizeObserver(() => {
+      this.map?.resize();
+    });
+    this._resizeObserver.observe(this);
+    this._resizeObserver.observe(this.shadowRoot.querySelector(".map-wrapper"));
+
+    requestAnimationFrame(() => this.map?.resize());
   }
 
   setupLiveLayers() {
@@ -834,7 +890,7 @@ class UrbanGreenMapV2 extends HTMLElement {
       id: "polygons-fill",
       type: "fill",
       source: "data",
-      filter: ["==", ["geometry-type"], "Polygon"],
+      filter: POLYGON_GEOMETRY_FILTER,
       paint: {
         "fill-color": ["get", "_color"],
         "fill-opacity": 0.7
@@ -846,7 +902,7 @@ class UrbanGreenMapV2 extends HTMLElement {
       id: "polygons-outline",
       type: "line",
       source: "data",
-      filter: ["==", ["geometry-type"], "Polygon"],
+      filter: POLYGON_GEOMETRY_FILTER,
       paint: {
         "line-color": ["get", "_color"],
         "line-width": [
@@ -864,7 +920,7 @@ class UrbanGreenMapV2 extends HTMLElement {
       id: "polygons-outline-outer",
       type: "line",
       source: "data",
-      filter: ["==", ["geometry-type"], "Polygon"],
+      filter: POLYGON_GEOMETRY_FILTER,
       paint: {
         "line-color": "#ffffff",
         "line-width": [
@@ -886,7 +942,7 @@ class UrbanGreenMapV2 extends HTMLElement {
       id: "lines-outer",
       type: "line",
       source: "data",
-      filter: ["==", ["geometry-type"], "LineString"],
+      filter: LINE_GEOMETRY_FILTER,
       paint: {
         "line-color": "#ffffff",
         "line-width": [
@@ -904,7 +960,7 @@ class UrbanGreenMapV2 extends HTMLElement {
       id: "lines",
       type: "line",
       source: "data",
-      filter: ["==", ["geometry-type"], "LineString"],
+      filter: LINE_GEOMETRY_FILTER,
       paint: {
         "line-color": ["get", "_color"],
         "line-width": [
@@ -917,39 +973,12 @@ class UrbanGreenMapV2 extends HTMLElement {
       }
     });
 
-    // Cluster circles
-    this.map.addLayer({
-      id: "clusters",
-      type: "circle",
-      source: "data",
-      filter: ["has", "point_count"],
-      paint: {
-        "circle-radius": ["step", ["get", "point_count"], 15, 10, 20, 50, 25, 200, 30],
-        "circle-color": "#10b981",
-        "circle-stroke-width": 2,
-        "circle-stroke-color": "#fff"
-      }
-    });
-
-    // Cluster count
-    this.map.addLayer({
-      id: "cluster-count",
-      type: "symbol",
-      source: "data",
-      filter: ["has", "point_count"],
-      layout: {
-        "text-field": ["get", "point_count_abbreviated"],
-        "text-size": 12
-      },
-      paint: { "text-color": "#fff" }
-    });
-
     // Individual points
     this.map.addLayer({
       id: "points",
       type: "circle",
       source: "data",
-      filter: ["all", ["==", ["geometry-type"], "Point"], ["!", ["has", "point_count"]]],
+      filter: POINT_GEOMETRY_FILTER,
       paint: {
         "circle-radius": 6,
         "circle-color": ["get", "_color"],
@@ -957,276 +986,6 @@ class UrbanGreenMapV2 extends HTMLElement {
         "circle-stroke-color": "#fff"
       }
     });
-  }
-
-  setupPmtiles() {
-    if (!this.map || this.pmtilesReady || !this.usesPmtiles() || !this.pmtilesProtocol) return;
-
-    try {
-      const archive = new pmtiles.PMTiles(this.pmtilesUrl);
-      this.pmtilesArchive = archive;
-      this.pmtilesProtocol.add(archive);
-
-      if (!this.map.getSource(PMTILES_SOURCE)) {
-        this.map.addSource(PMTILES_SOURCE, {
-          type: "vector",
-          url: `pmtiles://${this.pmtilesUrl}`,
-          attribution: "© Data contributors"
-        });
-      }
-
-      this.setupPmtilesLayers();
-      this.setupPmtilesInteractions();
-      this.pmtilesReady = true;
-      this.updatePmtilesFilters();
-      this.applyDataModeVisibility();
-    } catch (err) {
-      console.error("PMTiles setup error:", err);
-    }
-  }
-
-  setupPmtilesLayers() {
-    if (this.map.getLayer("pm-polygons-fill")) return;
-
-    const baseFilter = ["==", ["get", "__never__"], "__never__"];
-
-    this.map.addLayer({
-      id: "pm-polygons-fill",
-      type: "fill",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "fill-color": "#888888",
-        "fill-opacity": 0.7
-      },
-      layout: { visibility: "none" }
-    });
-
-    this.map.addLayer({
-      id: "pm-polygons-outline-outer",
-      type: "line",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "line-color": "#ffffff",
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          10, 3,
-          14, 4,
-          18, 5
-        ],
-        "line-opacity": 0.5
-      },
-      layout: { visibility: "none" }
-    });
-
-    this.map.addLayer({
-      id: "pm-polygons-outline",
-      type: "line",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "line-color": "#888888",
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          10, 2,
-          14, 3,
-          18, 4
-        ],
-        "line-opacity": 0.9
-      },
-      layout: { visibility: "none" }
-    });
-
-    this.map.addLayer({
-      id: "pm-lines-outer",
-      type: "line",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "line-color": "#ffffff",
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          10, 5,
-          14, 7,
-          18, 9
-        ],
-        "line-opacity": 0.6
-      },
-      layout: { visibility: "none" }
-    });
-
-    this.map.addLayer({
-      id: "pm-lines",
-      type: "line",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "line-color": "#888888",
-        "line-width": [
-          "interpolate", ["linear"], ["zoom"],
-          10, 3,
-          14, 4,
-          18, 6
-        ],
-        "line-opacity": 0.9
-      },
-      layout: { visibility: "none" }
-    });
-
-    this.map.addLayer({
-      id: "pm-points",
-      type: "circle",
-      source: PMTILES_SOURCE,
-      "source-layer": PMTILES_SOURCE_LAYER,
-      filter: baseFilter,
-      paint: {
-        "circle-radius": 6,
-        "circle-color": "#888888",
-        "circle-stroke-width": 1,
-        "circle-stroke-color": "#fff"
-      },
-      layout: { visibility: "none" }
-    });
-  }
-
-  updatePmtilesFilters() {
-    if (!this.pmtilesReady || !this.map) return;
-
-    const categories = this.getSelectedCategories();
-    this._pmHasCategory = categories.length > 0;
-    this._pmAllowedGeometries = this.getAllowedGeometriesForCategories(categories);
-
-    if (!categories.length) {
-      this.setPmtilesLayerVisibility(false);
-      return;
-    }
-
-    const impossible = ["==", ["get", "__never__"], "__never__"];
-    const buildCategoryExpr = (category) => {
-      const parts = [["==", this._pmTypeExpr, String(category.type)]];
-      if (category.subtypes) {
-        parts.push(["in", this._pmSubtypeExpr, ["literal", category.subtypes]]);
-      }
-      return parts.length === 1 ? parts[0] : ["all", ...parts];
-    };
-    const buildGeomFilter = (geomType) => {
-      const eligible = categories.filter(category =>
-        !category.geometries || category.geometries.includes(geomType)
-      );
-      if (!eligible.length) return impossible;
-
-      const categoryExprs = eligible.map(buildCategoryExpr);
-      const anyExpr = categoryExprs.length === 1 ? categoryExprs[0] : ["any", ...categoryExprs];
-      return ["all", ["==", ["geometry-type"], geomType], anyExpr];
-    };
-
-    const polygonFilter = buildGeomFilter("Polygon");
-    const lineFilter = buildGeomFilter("LineString");
-    const pointFilter = buildGeomFilter("Point");
-
-    this.map.setFilter("pm-polygons-fill", polygonFilter);
-    this.map.setFilter("pm-polygons-outline", polygonFilter);
-    this.map.setFilter("pm-polygons-outline-outer", polygonFilter);
-    this.map.setFilter("pm-lines", lineFilter);
-    this.map.setFilter("pm-lines-outer", lineFilter);
-    this.map.setFilter("pm-points", pointFilter);
-
-    const colorExpr = categories.length === 1 && !categories[0].multiColor
-      ? categories[0].color
-      : this.getPmSubtypeColorExpression();
-    this.map.setPaintProperty("pm-polygons-fill", "fill-color", colorExpr);
-    this.map.setPaintProperty("pm-polygons-outline", "line-color", colorExpr);
-    this.map.setPaintProperty("pm-lines", "line-color", colorExpr);
-    this.map.setPaintProperty("pm-points", "circle-color", colorExpr);
-
-    this.setPmtilesLayerVisibility(this._dataMode === "pmtiles", this._pmAllowedGeometries);
-  }
-
-  getAllowedGeometriesForCategories(categories) {
-    if (!categories.length) return null;
-    if (categories.some(category => !category.geometries)) return null;
-
-    const geomSet = new Set();
-    categories.forEach(category => {
-      category.geometries.forEach(geom => geomSet.add(geom));
-    });
-    return [...geomSet];
-  }
-
-  getPmSubtypeColorExpression() {
-    if (this._pmSubtypeColorExpr) return this._pmSubtypeColorExpr;
-
-    const expr = ["match", this._pmSubtypeExpr];
-    Object.entries(SUBTYPE_COLORS).forEach(([subtype, color]) => {
-      expr.push(subtype, color);
-    });
-    expr.push("#888888");
-    this._pmSubtypeColorExpr = expr;
-    return expr;
-  }
-
-  setLayerVisibility(layerId, visible) {
-    if (!this.map.getLayer(layerId)) return;
-    this.map.setLayoutProperty(layerId, "visibility", visible ? "visible" : "none");
-  }
-
-  setLiveLayerVisibility(visible) {
-    LIVE_LAYER_IDS.forEach(layerId => this.setLayerVisibility(layerId, visible));
-  }
-
-  setPmtilesLayerVisibility(visible, allowedGeometries = null) {
-    const show = visible && this._pmHasCategory;
-    const geomSet = allowedGeometries ? new Set(allowedGeometries) : null;
-    const showPolygons = show && (!geomSet || geomSet.has("Polygon"));
-    const showLines = show && (!geomSet || geomSet.has("LineString"));
-    const showPoints = show && (!geomSet || geomSet.has("Point"));
-
-    this.setLayerVisibility("pm-polygons-fill", showPolygons);
-    this.setLayerVisibility("pm-polygons-outline", showPolygons);
-    this.setLayerVisibility("pm-polygons-outline-outer", showPolygons);
-    this.setLayerVisibility("pm-lines", showLines);
-    this.setLayerVisibility("pm-lines-outer", showLines);
-    this.setLayerVisibility("pm-points", showPoints);
-  }
-
-  applyDataModeVisibility() {
-    const liveVisible = this.isLiveMode();
-    this.setLiveLayerVisibility(liveVisible);
-    this.setPmtilesLayerVisibility(!liveVisible, this._pmAllowedGeometries);
-  }
-
-  updateDataMode(force = false) {
-    if (!this.map) return;
-    const nextMode = this.usesPmtiles() ? "pmtiles" : "live";
-
-    if (force || nextMode !== this._dataMode) {
-      this.setDataMode(nextMode, force);
-    }
-  }
-
-  setDataMode(mode, force = false) {
-    if (!force && this._dataMode === mode) return;
-    this._dataMode = mode;
-
-    this.closeSidebar();
-    this.hideLoader();
-    this.applyDataModeVisibility();
-
-    if (this.isLiveMode()) {
-      if (this.getSelectedCategories().length) {
-        this.loadData();
-      }
-    } else {
-      this.loader?.abort();
-      this.clearMap();
-      this.updatePmtilesFilters();
-    }
   }
 
   setupBaseInteractions() {
@@ -1257,32 +1016,10 @@ class UrbanGreenMapV2 extends HTMLElement {
       this.map.on("mouseleave", layer, () => this.map.getCanvas().style.cursor = "");
     });
 
-    // Cluster click to zoom (live only)
-    this.map.on("click", "clusters", e => {
-      if (!this.isLiveMode() || !e.features?.[0] || !this.cluster) return;
-      this._featureClicked = true;
-      const clusterId = e.features[0].properties.cluster_id;
-      const zoom = this.cluster.getClusterExpansionZoom(clusterId);
-      this.map.easeTo({ center: e.features[0].geometry.coordinates, zoom });
-    });
-  }
-
-  setupPmtilesInteractions() {
-    // Click handlers for PMTiles features
-    ["pm-polygons-fill", "pm-lines", "pm-points"].forEach(layer => {
-      this.map.on("click", layer, e => {
-        if (e.features?.[0]) {
-          this._featureClicked = true;
-          this.showSidebar(e.features[0]);
-        }
-      });
-      this.map.on("mouseenter", layer, () => this.map.getCanvas().style.cursor = "pointer");
-      this.map.on("mouseleave", layer, () => this.map.getCanvas().style.cursor = "");
-    });
   }
 
   isLiveMode() {
-    return this._dataMode === "live";
+    return true;
   }
 
   getActiveCategory() {
@@ -1299,9 +1036,30 @@ class UrbanGreenMapV2 extends HTMLElement {
     const subtype = String(props.greenCodeSubtype || "").padStart(2, "0");
 
     if (typeCode && typeCode !== String(category.type)) return false;
-    if (category.geometries && !category.geometries.includes(geomType)) return false;
+    if (category.geometries && !this.categoryAllowsGeometry(category, geomType)) return false;
     if (category.subtypes && !category.subtypes.includes(subtype)) return false;
     return true;
+  }
+
+  categoryAllowsGeometry(category, geomType) {
+    if (!category.geometries || !geomType) return true;
+    return category.geometries.some(allowed => this.expandGeometryType(allowed).includes(geomType));
+  }
+
+  expandGeometryType(geomType) {
+    switch (geomType) {
+      case "Point":
+      case "MultiPoint":
+        return ["Point", "MultiPoint"];
+      case "LineString":
+      case "MultiLineString":
+        return ["LineString", "MultiLineString"];
+      case "Polygon":
+      case "MultiPolygon":
+        return ["Polygon", "MultiPolygon"];
+      default:
+        return [geomType];
+    }
   }
 
   getColorForFeature(feature, categories) {
@@ -1321,7 +1079,7 @@ class UrbanGreenMapV2 extends HTMLElement {
     if (!this.isLiveMode()) return;
 
     const seq = ++this._seq;
-    const uniqueTypes = [...new Set(categories.map(c => c.type))];
+    const loadRequests = this.getApiLoadRequests(categories);
     const loadingLabel = categories.length === 1 ? categories[0].name : `${categories.length} layers`;
 
     console.log(`🔄 Loading ${loadingLabel}...`);
@@ -1336,14 +1094,19 @@ class UrbanGreenMapV2 extends HTMLElement {
 
     try {
       const features = [];
-      for (const type of uniqueTypes) {
-        // Load ALL data for each required type (memory cache after first load)
-        const typeFeatures = await this.loader.loadTypeData(type);
+      const seenFeatureIds = new Set();
+      for (const request of loadRequests) {
+        const typeFeatures = await this.loader.loadTypeData(request.type, null, request.subtype);
         if (seq !== this._seq) {
           this.hideLoader();
           return; // Outdated request
         }
-        features.push(...typeFeatures);
+        typeFeatures.forEach(feature => {
+          const key = feature.properties?.id || JSON.stringify(feature.geometry);
+          if (seenFeatureIds.has(key)) return;
+          seenFeatureIds.add(key);
+          features.push(feature);
+        });
       }
 
       // Filter by category criteria
@@ -1385,6 +1148,37 @@ class UrbanGreenMapV2 extends HTMLElement {
     return filtered;
   }
 
+  getApiLoadRequests(categories) {
+    const seen = new Set();
+    const requests = [];
+
+    categories.forEach(category => {
+      const subtypes = category.subtypes?.length
+        ? category.subtypes
+        : this.getKnownSubtypesForType(category.type);
+      subtypes.forEach(subtype => {
+        const key = `${category.type}:${subtype || "*"}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        requests.push({ type: category.type, subtype });
+      });
+    });
+
+    return requests;
+  }
+
+  getKnownSubtypesForType(typeKey) {
+    const subcategories = MAIN_TYPES[typeKey]?.subcategories || {};
+    const subtypes = new Set();
+
+    Object.entries(subcategories).forEach(([subKey, subConfig]) => {
+      if (subKey === "all") return;
+      subConfig.subtypes?.forEach(subtype => subtypes.add(subtype));
+    });
+
+    return subtypes.size ? [...subtypes] : [null];
+  }
+
   updateMap(features, categoryOrCategories) {
     const categories = Array.isArray(categoryOrCategories) ? categoryOrCategories : [categoryOrCategories];
 
@@ -1401,48 +1195,26 @@ class UrbanGreenMapV2 extends HTMLElement {
       };
     });
 
-    // Separate points for clustering
-    const points = enriched.filter(f => f.geometry?.type === "Point");
-    const others = enriched.filter(f => f.geometry?.type !== "Point");
-
-    // Store for re-clustering on zoom
-    this._currentFeatures = { points, others };
-
-    // Setup cluster index
-    this.cluster = new Supercluster({ radius: 60, maxZoom: 16 });
-    this.cluster.load(points);
-
-    // Render with current zoom
-    this.renderClusters();
+    this._currentFeatures = enriched;
+    this.renderFeatures();
   }
 
-  renderClusters() {
-    if (!this._currentFeatures) return;
+  renderFeatures() {
+    if (!this.map || !this._currentFeatures) return;
 
-    const { points, others } = this._currentFeatures;
-
-    // Get clusters for current view
-    const bounds = this.map.getBounds();
-    const bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
-    const zoom = Math.floor(this.map.getZoom());
-    const clustered = this.cluster ? this.cluster.getClusters(bbox, zoom) : points;
-
-    // Combine all features
-    const allFeatures = [...others, ...clustered];
-
-    // Update source
     const source = this.map.getSource("data");
     if (source) {
       source.setData({
         type: "FeatureCollection",
-        features: allFeatures
+        features: this._currentFeatures
       });
     }
 
-    console.log(`🗺️ Rendered: ${others.length} polygons/lines, ${clustered.length} point clusters (zoom ${zoom})`);
+    console.log(`🗺️ Rendered: ${this._currentFeatures.length} features`);
   }
 
   clearMap() {
+    if (!this.map) return;
     const source = this.map.getSource("data");
     if (source) {
       source.setData({ type: "FeatureCollection", features: [] });
@@ -1501,7 +1273,6 @@ class UrbanGreenMapV2 extends HTMLElement {
       center = geom.coordinates[mid];
     }
 
-    // Icon section - use icon based on subtype
     const iconEl = this.shadowRoot.querySelector("#sidebarIcon");
     const iconUrl = info.icon ? iconUrlMap[info.icon] : null;
     if (iconUrl) {

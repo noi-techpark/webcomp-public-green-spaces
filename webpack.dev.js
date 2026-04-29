@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 const path = require('path');
+const MapLibreAssetsPlugin = require('./webpack.maplibre-assets');
 
 module.exports = {
   mode: 'development',
@@ -15,15 +16,27 @@ module.exports = {
   module: {
     rules: [
       {
+        resourceQuery: /inline/,
+        type: 'asset/source',
+      },
+      {
         test: /\.css$/i,
+        resourceQuery: { not: [/inline/] },
         use: ['style-loader', 'css-loader'],
       },
       {
-        test: /\.(svg|png|jpe?g|gif|webp)$/i,
+        test: /\.svg$/i,
+        type: 'asset/inline',
+      },
+      {
+        test: /\.(png|jpe?g|gif|webp)$/i,
         type: 'asset/resource',
       },
     ],
   },
+  plugins: [
+    new MapLibreAssetsPlugin(),
+  ],
   devServer: {
     static: path.resolve(__dirname, 'public'),
     port: 8998,

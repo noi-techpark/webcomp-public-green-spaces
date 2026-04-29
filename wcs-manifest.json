@@ -32,48 +32,50 @@
   "dist": {
     "basePath": "dist",
     "files": [
-      "webcomp-boilerplate.min.js"
+      "webcomp-boilerplate.min.js",
+      "maplibre-gl.js",
+      "maplibre-gl.css",
+      "maplibre-gl.js.LICENSE.txt"
     ],
     "scripts": [
+      {
+        "file": "maplibre-gl.js",
+        "parameter": ""
+      },
+      {
+        "file": "webcomp-boilerplate.min.js",
+        "parameter": ""
+      }
     ]
   },
   "configuration": {
-    "tagName": "",
+    "tagName": "r3gis-urbangreen-v2",
     "options": [
       {
-        "key": "pmtiles-url",
+        "key": "zoom",
         "type": "text",
-        "label": "url of the pmtiles which contains objects",
         "required": false,
+        "label": "Initial zoom (e.g. 13 or 13.5)",
+        "options": {
+          "default": "13"
+        }
+      },
+      {
+        "key": "lat",
+        "type": "text",
+        "required": false,
+        "label": "Initial latitude (e.g. 45.4064)",
         "options": {
           "default": ""
         }
       },
       {
-        "key": "zoom",
-        "type": "number",
-        "required": false,
-        "label": "Initial zoom",
-        "options": {
-          "default": 13
-        }
-      },
-      {
-        "key": "lat",
-        "type": "number",
-        "required": false,
-        "label": "Initial latitude",
-        "options": {
-          "default": 45.4064
-        }
-      },
-      {
         "key": "lng",
-        "type": "number",
+        "type": "text",
         "required": false,
-        "label": "Initial longitude",
+        "label": "Initial longitude (e.g. 11.8768)",
         "options": {
-          "default": 11.8768
+          "default": ""
         }
       },
       {

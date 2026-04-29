@@ -5,13 +5,9 @@
     "build": "webpack --config webpack.prod.js",
     "start": "webpack serve --config webpack.dev.js"
   },
-  "dependencies": {
-    "maplibre-gl": "^4.7.1",
-    "pmtiles": "^3.2.0",
-    "supercluster": "^8.0.1"
-  },
   "devDependencies": {
     "css-loader": "^7.1.2",
+    "maplibre-gl": "^4.7.1",
     "style-loader": "^4.0.0",
     "webpack": "^5.100.2",
     "webpack-cli": "^6.0.1",

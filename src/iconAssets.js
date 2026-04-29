@@ -1,8 +1,8 @@
+
 // SPDX-FileCopyrightText: NOI Techpark <digital@noi.bz.it>
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import logoUrl from "./open-data-hub-icons/Logo_RBG/OpenDataHub_Logo_BK-RGB.svg";
 import navBtnUrl from "./open-data-hub-icons/btn-navigation.svg";
 import lawnUrl from "./open-data-hub-icons/lawn.svg";
 import flowerbedUrl from "./open-data-hub-icons/flowerbed.svg";
@@ -13,7 +13,7 @@ import fountainUrl from "./open-data-hub-icons/fountain.svg";
 import wasteBinUrl from "./open-data-hub-icons/waste-bin.svg";
 import bollardUrl from "./open-data-hub-icons/bollard.svg";
 
-export { logoUrl, navBtnUrl };
+export { navBtnUrl };
 
 export const iconUrlMap = {
   "lawn.svg": lawnUrl,
